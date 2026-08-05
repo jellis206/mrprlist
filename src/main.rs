@@ -35,17 +35,60 @@ fn get_client() -> GitClient {
     }
 }
 
-fn get_prs(client: &GitClient) -> Result<Vec<u8>, std::io::Error> {
-    match client {
-        GitClient::GitLab => Command::new("glab")
-            .args(["mr", "list", "--author=@me"])
-            .output()
-            .map(|output| output.stdout),
-        GitClient::GitHub => Command::new("gh")
-            .args(["pr", "list", "--author=@me"])
-            .output()
-            .map(|output| output.stdout),
+fn get_prs(client: &GitClient) -> Result<std::process::Output, std::io::Error> {
+    let (bin, args) = match client {
+        GitClient::GitLab => ("glab", ["mr", "list", "--author=@me"]),
+        GitClient::GitHub => ("gh", ["pr", "list", "--author=@me"]),
+    };
+    Command::new(bin).args(args).output()
+}
+
+impl GitClient {
+    fn cli(&self) -> &'static str {
+        match self {
+            GitClient::GitLab => "glab",
+            GitClient::GitHub => "gh",
+        }
     }
+
+    fn noun(&self) -> &'static str {
+        match self {
+            GitClient::GitLab => "MRs",
+            GitClient::GitHub => "PRs",
+        }
+    }
+}
+
+/// "owner/repo" from either an SSH or HTTPS remote URL.
+fn repo_slug(url: &str) -> String {
+    let cleaned = url.trim_end_matches(".git").replace(':', "/");
+    let segs: Vec<&str> = cleaned.split('/').filter(|s| !s.is_empty()).collect();
+    match segs.len() {
+        0 | 1 => cleaned,
+        n => format!("{}/{}", segs[n - 2], segs[n - 1]),
+    }
+}
+
+fn current_branch() -> Option<String> {
+    Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Shown instead of an empty table when you have nothing open.
+fn display_repo_summary(client: &GitClient) {
+    let slug = get_remote_url().map(|u| repo_slug(&u));
+    println!(
+        "{}  {}",
+        slug.as_deref().unwrap_or("(no origin remote)").blue(),
+        current_branch().unwrap_or_default().green()
+    );
+    println!("no open {} authored by you", client.noun());
 }
 
 struct PullRequest {
@@ -147,13 +190,74 @@ fn main() {
     }
 
     let client = get_client();
-    if let Ok(output) = get_prs(&client) {
-        if let Ok(output_str) = String::from_utf8(output) {
-            let prs = match client {
-                GitClient::GitLab => collect_gitlab_prs(&output_str),
-                GitClient::GitHub => collect_github_prs(&output_str),
-            };
-            display_prs(prs);
+    let output = match get_prs(&client) {
+        Ok(o) => o,
+        // Don't exit silently — the usual cause is the CLI not being installed.
+        Err(e) => {
+            eprintln!("could not run `{}`: {}", client.cli(), e);
+            std::process::exit(1);
         }
+    };
+
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        eprintln!(
+            "`{}` failed: {}",
+            client.cli(),
+            err.trim().lines().next().unwrap_or("unknown error")
+        );
+        std::process::exit(1);
+    }
+
+    let output_str = String::from_utf8_lossy(&output.stdout).into_owned();
+    let prs = match client {
+        GitClient::GitLab => collect_gitlab_prs(&output_str),
+        GitClient::GitHub => collect_github_prs(&output_str),
+    };
+
+    if prs.is_empty() {
+        display_repo_summary(&client);
+    } else {
+        display_prs(prs);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slug_handles_ssh_and_https() {
+        assert_eq!(repo_slug("git@github.com:jellis206/mrprlist.git"), "jellis206/mrprlist");
+        assert_eq!(repo_slug("https://github.com/jellis206/carillon.git"), "jellis206/carillon");
+        assert_eq!(repo_slug("git@gitlab.com:acme/breeze-front-end.git"), "acme/breeze-front-end");
+    }
+
+    #[test]
+    fn parses_gh_tsv() {
+        // `gh pr list` emits tab-separated columns when not a tty.
+        let out = "12\tFix the flaky retry path\tfix-retry\tOPEN\n\
+                   7\tAdd tunnel support\ttunnel\tDRAFT\n";
+        let prs = collect_github_prs(out);
+        assert_eq!(prs.len(), 2);
+        assert_eq!(prs[0].id, "12");
+        assert_eq!(prs[0].title, "Fix the flaky retry path");
+        assert_eq!(prs[1].id, "7");
+    }
+
+    #[test]
+    fn parses_glab_list() {
+        let out = "Showing 2 open merge requests on breeze-front-end (Page 1)\n\n\
+                   !451  feat/new-picker  Add the new date picker (3 days ago)\n";
+        let prs = collect_gitlab_prs(out);
+        assert_eq!(prs.len(), 1);
+        assert_eq!(prs[0].id, "!451");
+        assert_eq!(prs[0].title, "Add the new date picker");
+    }
+
+    #[test]
+    fn empty_input_yields_no_prs() {
+        assert!(collect_github_prs("").is_empty());
+        assert!(collect_gitlab_prs("").is_empty());
     }
 }
