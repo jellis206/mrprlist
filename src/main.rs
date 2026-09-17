@@ -144,43 +144,147 @@ fn collect_github_prs(output_str: &str) -> Vec<PullRequest> {
     prs
 }
 
+fn terminal_columns() -> usize {
+    if let Ok(c) = std::env::var("COLUMNS") {
+        if let Ok(n) = c.parse::<usize>() {
+            if n > 0 {
+                return n;
+            }
+        }
+    }
+    tty_columns().unwrap_or(80)
+}
+
+/// Ask the tty for its size via `TIOCGWINSZ`. Works for the snacks.nvim
+/// dashboard PTY (and any real terminal) without an extra crate.
+#[cfg(unix)]
+fn tty_columns() -> Option<usize> {
+    #[repr(C)]
+    struct Winsize {
+        ws_row: u16,
+        ws_col: u16,
+        _x: u16,
+        _y: u16,
+    }
+
+    // TIOCGWINSZ: macOS/BSD use the _IOR encoding; Linux uses 0x5413.
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))]
+    const TIOCGWINSZ: std::os::raw::c_ulong = 0x4008_7468;
+    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd")))]
+    const TIOCGWINSZ: std::os::raw::c_ulong = 0x5413;
+
+    extern "C" {
+        fn ioctl(fd: std::os::raw::c_int, req: std::os::raw::c_ulong, ...) -> std::os::raw::c_int;
+    }
+
+    let mut ws = Winsize {
+        ws_row: 0,
+        ws_col: 0,
+        _x: 0,
+        _y: 0,
+    };
+    // Prefer stdout (the PTY snacks attaches), then stderr, then stdin.
+    for fd in [1, 2, 0] {
+        let rc = unsafe { ioctl(fd, TIOCGWINSZ, &mut ws as *mut Winsize) };
+        if rc == 0 && ws.ws_col > 0 {
+            return Some(ws.ws_col as usize);
+        }
+    }
+    None
+}
+
+#[cfg(not(unix))]
+fn tty_columns() -> Option<usize> {
+    None
+}
+
+/// Soft-wrap `text` into lines of at most `width` display characters,
+/// preferring breaks at spaces. `width == 0` yields the text unchanged.
+fn wrap_to_width(text: &str, width: usize) -> Vec<String> {
+    if width == 0 || text.chars().count() <= width {
+        return vec![text.to_string()];
+    }
+
+    let chars: Vec<char> = text.chars().collect();
+    let mut lines = Vec::new();
+    let mut start = 0;
+
+    while start < chars.len() {
+        let rest = chars.len() - start;
+        if rest <= width {
+            lines.push(chars[start..].iter().collect());
+            break;
+        }
+
+        let end = start + width;
+        let break_at = chars[start..end]
+            .iter()
+            .rposition(|&c| c == ' ')
+            .filter(|&i| i > 0)
+            .map(|i| start + i)
+            .unwrap_or(end);
+
+        let line: String = chars[start..break_at].iter().collect();
+        lines.push(line.trim_end().to_string());
+
+        start = break_at;
+        while start < chars.len() && chars[start] == ' ' {
+            start += 1;
+        }
+    }
+
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
 fn display_prs(prs: Vec<PullRequest>) {
     let max_id_width = prs
         .iter()
-        .map(|pr| pr.id.len())
+        .map(|pr| pr.id.chars().count())
         .max()
         .unwrap_or(2)
         .max("ID".len());
 
-    let max_title_width = prs
+    let id_padding = 2;
+    let id_column_width = max_id_width + id_padding;
+    // gap is the single space between the ID cell and the title cell
+    let gap = 1;
+
+    let cols = terminal_columns();
+    let title_col_width = cols
+        .saturating_sub(id_column_width + gap)
+        .max("TITLE".len());
+
+    let content_title_width = prs
         .iter()
-        .map(|pr| pr.title.len())
+        .map(|pr| pr.title.chars().count())
         .max()
         .unwrap_or(5)
         .max("TITLE".len());
+    // underline only as far as content, and never past the column edge
+    let title_rule_width = content_title_width.min(title_col_width);
 
-    let id_padding = 2;
-    let id_column_width = max_id_width + id_padding;
-
-    println!(
-        "{:<width$} {}",
-        "ID".white(),
-        "TITLE".white(),
-        width = id_column_width
-    );
+    // Format plain text first, then color — ANSI codes must not eat padding width.
+    let id_header = format!("{:<width$}", "ID", width = id_column_width);
+    println!("{} {}", id_header.white(), "TITLE".white());
 
     print!("{}", "─".repeat(max_id_width).white());
-    print!("{}", " ".repeat(id_padding));
-    print!(" "); // Added space to align with title column
-    println!("{}", "─".repeat(max_title_width).white());
+    print!("{}", " ".repeat(id_padding + gap));
+    println!("{}", "─".repeat(title_rule_width).white());
 
+    let hang = " ".repeat(id_column_width + gap);
     for pr in prs {
-        println!(
-            "{:<width$} {}",
-            pr.id.green(),
-            pr.title.blue(),
-            width = id_column_width
-        );
+        let title_lines = wrap_to_width(&pr.title, title_col_width);
+        for (i, line) in title_lines.iter().enumerate() {
+            if i == 0 {
+                let id_cell = format!("{:<width$}", pr.id, width = id_column_width);
+                println!("{} {}", id_cell.green(), line.blue());
+            } else {
+                println!("{}{}", hang, line.blue());
+            }
+        }
     }
 }
 
@@ -259,5 +363,29 @@ mod tests {
     fn empty_input_yields_no_prs() {
         assert!(collect_github_prs("").is_empty());
         assert!(collect_gitlab_prs("").is_empty());
+    }
+
+    #[test]
+    fn wrap_keeps_short_text() {
+        assert_eq!(wrap_to_width("hello", 10), vec!["hello".to_string()]);
+    }
+
+    #[test]
+    fn wrap_breaks_on_spaces() {
+        let lines = wrap_to_width("fix the flaky retry path now", 12);
+        assert_eq!(
+            lines,
+            vec![
+                "fix the".to_string(),
+                "flaky retry".to_string(),
+                "path now".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn wrap_hard_breaks_long_tokens() {
+        let lines = wrap_to_width("abcdefghij", 4);
+        assert_eq!(lines, vec!["abcd".to_string(), "efgh".to_string(), "ij".to_string()]);
     }
 }
